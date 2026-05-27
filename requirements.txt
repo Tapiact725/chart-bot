@@ -2,3 +2,4 @@ flask
 anthropic
 yfinance
 requests
+pytz
