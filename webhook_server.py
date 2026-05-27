@@ -16,14 +16,24 @@ app = Flask(__name__)
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
-NEWS_API_KEY      = os.environ.get("NEWS_API_KEY", "")      # free at newsapi.org
-SHEETS_WEBHOOK    = os.environ.get("SHEETS_WEBHOOK", "")    # optional Google Sheets
+NEWS_API_KEY      = os.environ.get("NEWS_API_KEY", "")
+ALPHA_VANTAGE_KEY = os.environ.get("ALPHA_VANTAGE_KEY", "")  # free at alphavantage.co
+SHEETS_WEBHOOK    = os.environ.get("SHEETS_WEBHOOK", "")
 DATA_FILE         = "/tmp/bot_data.json"
 
-# ─────────────────────────────────────────
-# WATCHLIST — add your tickers here
-# ─────────────────────────────────────────
 WATCHLIST = ["NVDA", "TSLA", "AMD", "SMH", "ARM", "AAPL", "META", "MSFT", "SPY", "QQQ"]
+
+SECTOR_MAP = {
+    "NVDA": "SMH", "AMD": "SMH", "ARM": "SMH", "INTC": "SMH",
+    "TSLA": "QQQ", "AAPL": "QQQ", "META": "QQQ", "MSFT": "QQQ",
+    "SPY":  "SPY", "QQQ":  "QQQ"
+}
+
+CORRELATED_GROUPS = [
+    ["NVDA", "AMD", "ARM", "SMH", "INTC"],
+    ["AAPL", "MSFT", "META", "QQQ"],
+    ["TSLA"]
+]
 
 # ─────────────────────────────────────────
 # PERSISTENT STORAGE
@@ -36,10 +46,10 @@ def load_data():
     except:
         pass
     return {
-        "signal_log": [],
+        "signal_log":      [],
         "circuit_breaker": {"consecutive_losses": 0},
-        "last_update_id": 0,
-        "open_trades": {}
+        "last_update_id":  0,
+        "open_trades":     {}
     }
 
 def save_data():
@@ -79,8 +89,7 @@ def send_telegram(text, chat_id=None, reply_markup=None):
     except Exception as e:
         print(f"Telegram error: {e}")
 
-def send_alert_with_buttons(text, ticker, chat_id=None):
-    """Send alert with inline Win/Loss/Ignore buttons"""
+def send_with_buttons(text, ticker, chat_id=None):
     markup = {
         "inline_keyboard": [[
             {"text": "✅ Win",    "callback_data": f"win_{ticker}"},
@@ -90,11 +99,11 @@ def send_alert_with_buttons(text, ticker, chat_id=None):
     }
     send_telegram(text, chat_id, reply_markup=markup)
 
-def answer_callback(callback_query_id):
+def answer_callback(cq_id):
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
-            json={"callback_query_id": callback_query_id}, timeout=5
+            json={"callback_query_id": cq_id}, timeout=5
         )
     except:
         pass
@@ -112,11 +121,9 @@ def telegram_polling_loop():
                 params={"offset": last_update_id + 1, "timeout": 30},
                 timeout=35
             )
-            updates = r.json().get("result", [])
-            for update in updates:
+            for update in r.json().get("result", []):
                 last_update_id = update["update_id"]
 
-                # Handle button taps
                 if "callback_query" in update:
                     cq      = update["callback_query"]
                     data    = cq.get("data", "")
@@ -126,11 +133,10 @@ def telegram_polling_loop():
                         action, ticker = data.split("_", 1)
                         mark_signal(ticker.upper(), action, chat_id)
 
-                # Handle text commands
                 elif "message" in update:
-                    message = update["message"]
-                    text    = message.get("text", "").strip()
-                    chat_id = str(message.get("chat", {}).get("id", ""))
+                    msg     = update["message"]
+                    text    = msg.get("text", "").strip()
+                    chat_id = str(msg.get("chat", {}).get("id", ""))
                     if text and chat_id:
                         handle_command(text, chat_id)
 
@@ -140,11 +146,10 @@ def telegram_polling_loop():
             time.sleep(5)
         time.sleep(1)
 
-polling_thread = threading.Thread(target=telegram_polling_loop, daemon=True)
-polling_thread.start()
+threading.Thread(target=telegram_polling_loop, daemon=True).start()
 
 # ─────────────────────────────────────────
-# AUTO EXPIRE SIGNALS (48hrs)
+# AUTO EXPIRE (48hrs)
 # ─────────────────────────────────────────
 def auto_expire_loop():
     while True:
@@ -153,8 +158,7 @@ def auto_expire_loop():
             for s in signal_log:
                 if s["result"] == "pending":
                     try:
-                        signal_time = datetime.fromisoformat(str(s["time"]))
-                        if (now - signal_time).total_seconds() / 3600 > 48:
+                        if (now - datetime.fromisoformat(str(s["time"]))).total_seconds() / 3600 > 48:
                             s["result"] = "expired"
                     except:
                         pass
@@ -178,13 +182,10 @@ def check_outcomes_loop():
                 if not all(k in s for k in ["target1", "stop"]):
                     continue
                 try:
-                    signal_time = datetime.fromisoformat(str(s["time"]))
-                    hours_old   = (now - signal_time).total_seconds() / 3600
-
+                    hours_old = (now - datetime.fromisoformat(str(s["time"]))).total_seconds() / 3600
                     if hours_old >= 4 and not s.get("checked_4h"):
                         s["checked_4h"] = True
                         check_price_vs_levels(s, "4hr")
-
                     if hours_old >= 24 and not s.get("checked_24h"):
                         s["checked_24h"] = True
                         check_price_vs_levels(s, "24hr")
@@ -204,7 +205,7 @@ def check_price_vs_levels(signal, timeframe):
         entry   = float(signal.get("price", 0))
         bias    = signal.get("bias", "bullish")
 
-        df = yf.download(ticker, period="1d", interval="5m", progress=False)
+        df = yf.download(ticker, period="1d", interval="1m", progress=False)
         if df.empty:
             return
 
@@ -214,7 +215,7 @@ def check_price_vs_levels(signal, timeframe):
         pnl     = ((current - entry) / entry * 100) if entry > 0 else 0
 
         msg = f"🔍 *AUTO CHECK — {ticker} ({timeframe})*\n"
-        msg += f"Entry: ${entry:.2f} → Current: ${current:.2f} ({pnl:+.1f}%)\n"
+        msg += f"Entry: ${entry:.2f} → Now: ${current:.2f} ({pnl:+.1f}%)\n"
 
         if bias == "bullish":
             if target2 > 0 and high >= target2:
@@ -230,7 +231,7 @@ def check_price_vs_levels(signal, timeframe):
                 signal["result"] = "loss"
                 circuit_breaker["consecutive_losses"] += 1
             else:
-                msg += f"⏳ Still in play | H: ${high:.2f} L: ${low:.2f}"
+                msg += f"⏳ Still in play | H:${high:.2f} L:${low:.2f}"
         else:
             if target1 > 0 and low <= target1:
                 msg += f"✅ *TARGET 1 HIT* (${target1:.2f})"
@@ -241,7 +242,7 @@ def check_price_vs_levels(signal, timeframe):
                 signal["result"] = "loss"
                 circuit_breaker["consecutive_losses"] += 1
             else:
-                msg += f"⏳ Still in play | H: ${high:.2f} L: ${low:.2f}"
+                msg += f"⏳ Still in play | H:${high:.2f} L:${low:.2f}"
 
         send_telegram(msg)
         save_data()
@@ -251,99 +252,80 @@ def check_price_vs_levels(signal, timeframe):
 threading.Thread(target=check_outcomes_loop, daemon=True).start()
 
 # ─────────────────────────────────────────
-# DAILY MORNING BRIEF (9am ET)
+# MORNING BRIEF (9am ET weekdays)
+# WEEKLY SUMMARY (Sunday 8pm ET)
 # ─────────────────────────────────────────
-def morning_brief_loop():
+def scheduler_loop():
     while True:
         try:
             et_tz  = pytz.timezone("America/New_York")
             now_et = datetime.now(et_tz)
-            # Fire at 9:00 AM ET on weekdays
             if now_et.weekday() < 5 and now_et.hour == 9 and now_et.minute == 0:
                 send_morning_brief()
-                time.sleep(61)  # prevent double fire
-            # Weekly summary Sunday 8pm ET
+                time.sleep(61)
             if now_et.weekday() == 6 and now_et.hour == 20 and now_et.minute == 0:
                 send_weekly_summary()
                 time.sleep(61)
         except Exception as e:
-            print(f"Brief loop error: {e}")
+            print(f"Scheduler error: {e}")
         time.sleep(30)
+
+threading.Thread(target=scheduler_loop, daemon=True).start()
 
 def send_morning_brief():
     try:
         et_tz  = pytz.timezone("America/New_York")
         now_et = datetime.now(et_tz)
+        brief  = f"🌅 *MORNING BRIEF — {now_et.strftime('%A %b %d')}*\n━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        brief = f"🌅 *MORNING BRIEF — {now_et.strftime('%A %b %d')}*\n"
-        brief += "━━━━━━━━━━━━━━━━━━━━\n\n"
-
-        # Market regime for SPY + QQQ
-        spy_regime, spy_rsi, _ = detect_regime("SPY")
-        qqq_regime, qqq_rsi, _ = detect_regime("QQQ")
-        brief += f"📊 *MARKET REGIME:*\n"
-        brief += f"SPY: {spy_regime} | RSI: {spy_rsi:.0f}\n"
+        # Market regime
+        spy_regime, spy_rsi, _ = get_regime_info("SPY")
+        qqq_regime, qqq_rsi, _ = get_regime_info("QQQ")
+        brief += f"📊 *MARKET:*\nSPY: {spy_regime} | RSI: {spy_rsi:.0f}\n"
         brief += f"QQQ: {qqq_regime} | RSI: {qqq_rsi:.0f}\n\n"
 
-        # Pre-market movers from watchlist
-        brief += f"📈 *PRE-MARKET MOVERS:*\n"
+        # Pre-market movers
+        brief += "📈 *PRE-MARKET MOVERS:*\n"
         movers = []
         for ticker in WATCHLIST[:8]:
             try:
                 df = yf.download(ticker, period="2d", interval="1d", progress=False)
                 if len(df) >= 2:
-                    prev  = float(df["Close"].values[-2])
-                    curr  = float(df["Close"].values[-1])
-                    chg   = ((curr - prev) / prev) * 100
+                    prev = float(df["Close"].values[-2])
+                    curr = float(df["Close"].values[-1])
+                    chg  = ((curr - prev) / prev) * 100
                     movers.append((ticker, chg, curr))
             except:
                 pass
-
         movers.sort(key=lambda x: abs(x[1]), reverse=True)
         for ticker, chg, price in movers[:5]:
             emoji = "🟢" if chg > 0 else "🔴"
             brief += f"{emoji} {ticker}: ${price:.2f} ({chg:+.1f}%)\n"
 
-        # Top setups
-        brief += f"\n🎯 *TOP SETUPS TO WATCH:*\n"
+        # Setups
+        brief += "\n🎯 *TOP SETUPS:*\n"
         setups = scan_watchlist_setups()
-        if setups:
-            for s in setups[:3]:
-                brief += f"• {s}\n"
-        else:
-            brief += "• No high-conviction setups yet — wait for open\n"
+        for s in (setups[:3] if setups else ["No high-conviction setups yet"]):
+            brief += f"• {s}\n"
 
-        # Earnings warnings
-        brief += f"\n📅 *EARNINGS THIS WEEK:*\n"
+        # Earnings
+        brief += "\n📅 *EARNINGS THIS WEEK:*\n"
         earnings = check_earnings_week()
-        if earnings:
-            for e in earnings:
-                brief += f"⚠️ {e}\n"
-        else:
-            brief += "No major earnings in your watchlist\n"
+        for e in (earnings if earnings else ["No major earnings in watchlist"]):
+            brief += f"⚠️ {e}\n"
 
-        brief += f"\n_Market opens in {max(0, 30 - datetime.now(et_tz).minute)} min_"
         send_telegram(brief)
-
     except Exception as e:
         print(f"Morning brief error: {e}")
-        send_telegram(f"⚠️ Morning brief error: {str(e)}")
 
 def send_weekly_summary():
     try:
-        win_rate = get_win_rate()
-        wins     = len([s for s in signal_log if s["result"] == "win"])
-        losses   = len([s for s in signal_log if s["result"] == "loss"])
-
-        # Best combo this week
-        week_ago = datetime.now() - timedelta(days=7)
-        week_signals = [
-            s for s in signal_log
-            if datetime.fromisoformat(str(s["time"])) > week_ago
-        ]
-
+        win_rate    = get_win_rate()
+        week_ago    = datetime.now() - timedelta(days=7)
+        week_sigs   = [s for s in signal_log if datetime.fromisoformat(str(s["time"])) > week_ago]
         combo_stats = {}
-        for s in week_signals:
+
+        for s in week_sigs:
             c = s["combo"]
             if c not in combo_stats:
                 combo_stats[c] = {"win": 0, "loss": 0}
@@ -351,344 +333,101 @@ def send_weekly_summary():
                 combo_stats[c][s["result"]] += 1
 
         summary  = f"📊 *WEEKLY SUMMARY*\n━━━━━━━━━━━━━━━━━━━━\n"
-        summary += f"Signals this week: {len(week_signals)}\n"
-        summary += f"Overall win rate: {f'{win_rate:.0f}%' if win_rate else 'Building...'}\n\n"
-        summary += f"*COMBO PERFORMANCE:*\n"
+        summary += f"Signals this week: {len(week_sigs)}\n"
+        summary += f"Win rate: {f'{win_rate:.0f}%' if win_rate else 'Building...'}\n\n"
+        summary += "*COMBO PERFORMANCE:*\n"
 
         for combo, stats in combo_stats.items():
             total = stats["win"] + stats["loss"]
             wr    = f"{(stats['win']/total*100):.0f}%" if total > 0 else "N/A"
             summary += f"• {combo}: {stats['win']}W/{stats['loss']}L ({wr})\n"
 
-        summary += f"\n*BEST PERFORMING TICKER:*\n"
-        ticker_stats = {}
-        for s in week_signals:
-            t = s["ticker"]
-            if t not in ticker_stats:
-                ticker_stats[t] = {"win": 0, "loss": 0}
-            if s["result"] in ["win", "loss"]:
-                ticker_stats[t][s["result"]] += 1
-
-        best = sorted(
-            ticker_stats.items(),
-            key=lambda x: x[1]["win"] - x[1]["loss"],
-            reverse=True
-        )
-        for ticker, stats in best[:3]:
-            summary += f"• {ticker}: {stats['win']}W/{stats['loss']}L\n"
-
         send_telegram(summary)
     except Exception as e:
         print(f"Weekly summary error: {e}")
 
-threading.Thread(target=morning_brief_loop, daemon=True).start()
-
 # ─────────────────────────────────────────
-# NEWS SENTIMENT CHECK
+# REAL TIME DATA
+# Uses Alpha Vantage if key available
+# Falls back to yfinance 1min otherwise
 # ─────────────────────────────────────────
-def check_news_sentiment(ticker):
-    if not NEWS_API_KEY:
-        return None, []
-
-    try:
-        r = requests.get(
-            "https://newsapi.org/v2/everything",
-            params={
-                "q":        ticker,
-                "sortBy":   "publishedAt",
-                "pageSize": 5,
-                "apiKey":   NEWS_API_KEY,
-                "language": "en"
-            },
-            timeout=5
-        )
-        articles = r.json().get("articles", [])
-        if not articles:
-            return "neutral", []
-
-        negative_words = [
-            "lawsuit", "investigation", "fraud", "miss", "loss", "decline",
-            "crash", "ban", "recall", "downgrade", "warning", "risk",
-            "bankruptcy", "sec", "fine", "penalty", "hack", "breach"
-        ]
-        positive_words = [
-            "beat", "upgrade", "record", "growth", "profit", "deal",
-            "partnership", "launch", "breakthrough", "strong", "surge"
-        ]
-
-        neg_count = 0
-        pos_count = 0
-        headlines = []
-
-        for article in articles[:3]:
-            title = article.get("title", "").lower()
-            headlines.append(article.get("title", ""))
-            neg_count += sum(1 for w in negative_words if w in title)
-            pos_count += sum(1 for w in positive_words if w in title)
-
-        if neg_count > pos_count + 1:
-            return "negative", headlines
-        elif pos_count > neg_count:
-            return "positive", headlines
-        else:
-            return "neutral", headlines
-
-    except Exception as e:
-        print(f"News error: {e}")
-        return None, []
-
-# ─────────────────────────────────────────
-# EARNINGS CHECK
-# ─────────────────────────────────────────
-def check_earnings(ticker):
-    try:
-        stock = yf.Ticker(ticker)
-        cal   = stock.calendar
-        if cal is None or cal.empty:
-            return None
-
-        if hasattr(cal, 'columns'):
-            if 'Earnings Date' in cal.columns:
-                dates = cal['Earnings Date']
-                if len(dates) > 0:
-                    earnings_date = dates.iloc[0]
-                    if hasattr(earnings_date, 'date'):
-                        days_until = (earnings_date.date() - datetime.now().date()).days
-                        if 0 <= days_until <= 7:
-                            return days_until
-        return None
-    except:
-        return None
-
-def check_earnings_week():
-    warnings = []
-    for ticker in WATCHLIST:
-        days = check_earnings(ticker)
-        if days is not None:
-            warnings.append(f"{ticker} earnings in {days} day{'s' if days != 1 else ''}")
-    return warnings
-
-# ─────────────────────────────────────────
-# OPTIONS FLOW CHECK
-# Uses unusual volume as proxy
-# ─────────────────────────────────────────
-def check_options_flow(ticker):
-    try:
-        stock = yf.Ticker(ticker)
-        opts  = stock.options
-        if not opts:
-            return None
-
-        nearest_exp = opts[0]
-        chain       = stock.option_chain(nearest_exp)
-        calls       = chain.calls
-        puts        = chain.puts
-
-        if calls.empty or puts.empty:
-            return None
-
-        call_vol = calls["volume"].sum()
-        put_vol  = puts["volume"].sum()
-
-        if call_vol + put_vol == 0:
-            return None
-
-        put_call_ratio = put_vol / (call_vol + 1)
-
-        if put_call_ratio > 1.5:
-            return f"🐋 High PUT activity on {ticker} (P/C ratio: {put_call_ratio:.1f}) — smart money hedging?"
-        elif put_call_ratio < 0.5:
-            return f"🐋 High CALL activity on {ticker} (P/C ratio: {put_call_ratio:.1f}) — bullish flow"
-        return None
-    except:
-        return None
-
-# ─────────────────────────────────────────
-# SECTOR HEALTH CHECK
-# ─────────────────────────────────────────
-SECTOR_MAP = {
-    "NVDA": "SMH", "AMD": "SMH", "ARM": "SMH", "INTC": "SMH",
-    "TSLA": "QQQ", "AAPL": "QQQ", "META": "QQQ", "MSFT": "QQQ",
-    "SPY": "SPY",  "QQQ": "QQQ"
-}
-
-def check_sector_health(ticker):
-    try:
-        sector_etf = SECTOR_MAP.get(ticker, "SPY")
-        if sector_etf == ticker:
-            return None
-
-        df = yf.download(sector_etf, period="5d", interval="1d", progress=False)
-        if df.empty or len(df) < 2:
-            return None
-
-        today_chg = ((float(df["Close"].values[-1]) - float(df["Close"].values[-2]))
-                     / float(df["Close"].values[-2]) * 100)
-
-        if today_chg < -1.5:
-            return f"⚠️ Sector ({sector_etf}) down {today_chg:.1f}% today — weakens bullish signals"
-        elif today_chg > 1.5:
-            return f"✅ Sector ({sector_etf}) up {today_chg:.1f}% today — strengthens bullish signals"
-        return None
-    except:
-        return None
-
-# ─────────────────────────────────────────
-# CORRELATION WARNING
-# ─────────────────────────────────────────
-CORRELATED_GROUPS = [
-    ["NVDA", "AMD", "ARM", "SMH", "INTC"],
-    ["AAPL", "MSFT", "META", "QQQ"],
-    ["TSLA"]
-]
-
-def check_correlation_risk(ticker):
-    warnings = []
-    for group in CORRELATED_GROUPS:
-        if ticker in group:
-            for open_ticker in open_trades:
-                if open_ticker in group and open_ticker != ticker:
-                    warnings.append(
-                        f"📊 You have open {open_ticker} trade — {ticker} & {open_ticker} "
-                        f"are highly correlated. Double sector risk."
-                    )
-    return warnings
-
-# ─────────────────────────────────────────
-# MULTI-TIMEFRAME CONFIRMATION
-# ─────────────────────────────────────────
-def check_higher_timeframe(ticker, current_interval):
-    try:
-        is_intraday = any(x in current_interval for x in ["1", "5", "15", "30", "60"])
-        if not is_intraday:
-            return None
-
-        df = yf.download(ticker, period="30d", interval="1d", progress=False)
-        if df.empty or len(df) < 20:
-            return None
-
-        closes = df["Close"].values.flatten()
-        ema10  = sum(closes[-10:]) / 10
-        ema20  = sum(closes[-20:]) / 20
-        last   = float(closes[-1])
-
-        if last > ema10 > ema20:
-            return "✅ Daily chart agrees — uptrend confirmed (HIGH conviction)"
-        elif last < ema10 < ema20:
-            return "⚠️ Daily chart disagrees — daily downtrend. Reduce size."
-        else:
-            return "↔️ Daily chart mixed — medium conviction"
-    except:
-        return None
-
-# ─────────────────────────────────────────
-# RISK/REWARD CALCULATOR
-# ─────────────────────────────────────────
-def calculate_rr(entry, target1, stop):
-    try:
-        if not all([entry, target1, stop]):
-            return None
-        reward = abs(target1 - entry)
-        risk   = abs(entry - stop)
-        if risk == 0:
-            return None
-        rr = reward / risk
-        emoji = "✅" if rr >= 2 else "⚠️" if rr >= 1.5 else "❌"
-        return f"{emoji} R:R = {rr:.1f}:1 | Risk: ${risk:.2f} | Reward: ${reward:.2f}"
-    except:
-        return None
-
-# ─────────────────────────────────────────
-# WATCHLIST SCANNER (for morning brief)
-# ─────────────────────────────────────────
-def scan_watchlist_setups():
-    setups = []
-    for ticker in WATCHLIST:
+def get_candle_data(ticker, interval_str=""):
+    # Try Alpha Vantage first (most accurate)
+    if ALPHA_VANTAGE_KEY:
         try:
-            df = yf.download(ticker, period="30d", interval="1d", progress=False)
-            if df.empty or len(df) < 20:
-                continue
+            is_swing  = any(x in str(interval_str).upper() for x in ["1D","1W","D","W","DAY","WEEK"])
+            av_interval = "daily" if is_swing else "5min"
+            r = requests.get(
+                "https://www.alphavantage.co/query",
+                params={
+                    "function":   "TIME_SERIES_INTRADAY" if not is_swing else "TIME_SERIES_DAILY",
+                    "symbol":     ticker,
+                    "interval":   av_interval if not is_swing else None,
+                    "outputsize": "compact",
+                    "apikey":     ALPHA_VANTAGE_KEY
+                },
+                timeout=10
+            )
+            data = r.json()
+            key  = [k for k in data.keys() if "Time Series" in k]
+            if key:
+                series = data[key[0]]
+                lines  = []
+                for ts, vals in list(series.items())[:10]:
+                    lines.append(
+                        f"{ts} | O:{float(vals['1. open']):.2f} "
+                        f"H:{float(vals['2. high']):.2f} "
+                        f"L:{float(vals['3. low']):.2f} "
+                        f"C:{float(vals['4. close']):.2f} "
+                        f"V:{int(float(vals['5. volume']))}"
+                    )
+                if lines:
+                    return "\n".join(lines) + "\n_(Alpha Vantage — 5min data)_"
+        except Exception as e:
+            print(f"Alpha Vantage error: {e}")
 
-            closes = df["Close"].values.flatten()
-            highs  = df["High"].values.flatten()
-            lows   = df["Low"].values.flatten()
-            vols   = df["Volume"].values.flatten()
-
-            ema10    = sum(closes[-10:]) / 10
-            ema20    = sum(closes[-20:]) / 20
-            last     = float(closes[-1])
-            vol_avg  = sum(vols[-20:]) / 20
-            vol_now  = float(vols[-1])
-
-            # RSI
-            gains, losses = [], []
-            for i in range(-14, 0):
-                diff = float(closes[i]) - float(closes[i-1])
-                if diff > 0: gains.append(diff); losses.append(0)
-                else: gains.append(0); losses.append(abs(diff))
-            avg_gain = sum(gains) / 14 if gains else 0.001
-            avg_loss = sum(losses) / 14 if losses else 0.001
-            rsi = 100 - (100 / (1 + avg_gain / avg_loss))
-
-            # Dip setup
-            if rsi < 35 and last < ema20 and vol_now > vol_avg:
-                setups.append(f"🎣 {ticker} — Dip setup (RSI: {rsi:.0f}, oversold + volume)")
-
-            # Breakout setup
-            if last > float(highs[-2]) and vol_now > vol_avg * 1.3:
-                setups.append(f"🚀 {ticker} — Breakout above recent high with volume")
-
-            # Trend pullback
-            if float(ema10) > float(ema20) and last < float(ema10) * 1.005 and rsi < 50:
-                setups.append(f"📈 {ticker} — Trend pullback to EMA10 in uptrend")
-
-        except:
-            pass
-    return setups[:5]
-
-# ─────────────────────────────────────────
-# GOOGLE SHEETS LOGGER
-# ─────────────────────────────────────────
-def log_to_sheets(signal_data):
-    if not SHEETS_WEBHOOK:
-        return
-    try:
-        requests.post(SHEETS_WEBHOOK, json=signal_data, timeout=5)
-    except Exception as e:
-        print(f"Sheets error: {e}")
-
-# ─────────────────────────────────────────
-# WIN RATE
-# ─────────────────────────────────────────
-def get_win_rate():
-    resolved = [s for s in signal_log if s["result"] in ["win", "loss"]]
-    last10   = resolved[-10:]
-    if len(last10) < 3:
-        return None
-    return (len([s for s in last10 if s["result"] == "win"]) / len(last10)) * 100
-
-# ─────────────────────────────────────────
-# REGIME DETECTION
-# ─────────────────────────────────────────
-def detect_regime(ticker, interval_str=""):
+    # Fall back to yfinance 1min
     try:
         is_swing = any(x in str(interval_str).upper() for x in ["1D","1W","D","W","DAY","WEEK"])
-        period   = "60d" if is_swing else "30d"
-        df       = yf.download(ticker, period=period, interval="1d", progress=False)
+        df = yf.download(
+            ticker,
+            period="30d" if is_swing else "1d",
+            interval="1d" if is_swing else "1m",
+            progress=False
+        )
+        if df.empty:
+            return "No data available"
+        lines = []
+        for ts, row in df.tail(10).iterrows():
+            lines.append(
+                f"{ts.strftime('%m/%d %H:%M')} | O:{float(row['Open']):.2f} "
+                f"H:{float(row['High']):.2f} L:{float(row['Low']):.2f} "
+                f"C:{float(row['Close']):.2f} V:{int(float(row['Volume']))}"
+            )
+        return "\n".join(lines) + "\n_(yfinance 1min)_"
+    except Exception as e:
+        return f"Data error: {e}"
 
+# ─────────────────────────────────────────
+# REGIME INFO (for morning brief + context)
+# ─────────────────────────────────────────
+def get_regime_info(ticker, interval_str=""):
+    try:
+        is_swing = any(x in str(interval_str).upper() for x in ["1D","1W","D","W","DAY","WEEK"])
+        df = yf.download(ticker, period="60d" if is_swing else "30d", interval="1d", progress=False)
         if df.empty or len(df) < 10:
             return "unknown", 50.0, False
 
-        closes  = df["Close"].values.flatten()
-        highs   = df["High"].values.flatten()
-        lows    = df["Low"].values.flatten()
-        vols    = df["Volume"].values.flatten()
-        n       = len(closes)
+        closes = df["Close"].values.flatten()
+        highs  = df["High"].values.flatten()
+        lows   = df["Low"].values.flatten()
+        vols   = df["Volume"].values.flatten()
+        n      = len(closes)
 
-        ema10   = sum(closes[-10:]) / 10
-        ema20   = sum(closes[-min(20,n):]) / min(20,n)
-        ema50   = sum(closes[-min(50,n):]) / min(50,n)
-        atr     = sum([highs[i] - lows[i] for i in range(-10, 0)]) / 10
+        ema10  = sum(closes[-10:]) / 10
+        ema20  = sum(closes[-min(20,n):]) / min(20,n)
+        ema50  = sum(closes[-min(50,n):]) / min(50,n)
+        atr    = sum([highs[i] - lows[i] for i in range(-10, 0)]) / 10
         atr_pct = (atr / closes[-1]) * 100
 
         vol_recent = sum(vols[-5:]) / 5
@@ -704,9 +443,9 @@ def detect_regime(ticker, interval_str=""):
         avg_loss = sum(losses) / 14 if losses else 0.001
         rsi = 100 - (100 / (1 + avg_gain / avg_loss))
 
-        et_tz       = pytz.timezone("America/New_York")
-        now_et      = datetime.now(et_tz)
-        is_extended = (now_et.time() < dtime(9, 30) or now_et.time() >= dtime(16, 0))
+        et_tz      = pytz.timezone("America/New_York")
+        now_et     = datetime.now(et_tz)
+        is_extended = now_et.time() < dtime(9, 30) or now_et.time() >= dtime(16, 0)
 
         score = 0
         if float(ema10) > float(ema20): score += 20
@@ -718,91 +457,246 @@ def detect_regime(ticker, interval_str=""):
 
         regime = "TRENDING 📈" if score >= 65 else "MIXED ↔️" if score >= 40 else "CHOPPY ⚠️"
         return regime, rsi, is_extended
-
-    except Exception as e:
-        print(f"Regime error: {e}")
+    except:
         return "unknown", 50.0, False
 
 # ─────────────────────────────────────────
-# ADAPTIVE FILTER
+# ENRICHMENT CHECKS
+# These ADD info — they never block signals
+# Only exception: circuit breaker + earnings
 # ─────────────────────────────────────────
-def should_fire(ticker, combo, regime, rsi, is_extended):
-    hard_skip = []
-    soft_warn = []
 
-    if circuit_breaker["consecutive_losses"] >= 3:
-        hard_skip.append("⛔ Circuit breaker — 3 consecutive losses")
-    if regime == "CHOPPY ⚠️" and "Dip" in combo:
-        hard_skip.append("⚠️ Choppy market — Dip & Rip unreliable")
-    win_rate = get_win_rate()
-    if win_rate and win_rate < 35:
-        hard_skip.append(f"📉 Win rate {win_rate:.0f}% — filters tightened")
-    if rsi > 75 and "Momentum" in combo:
-        hard_skip.append(f"🔴 RSI {rsi:.0f} — overbought for momentum")
-    if is_extended:
-        soft_warn.append("🌙 Extended hours — lower liquidity, wider spreads")
-
-    return (False, hard_skip + soft_warn) if hard_skip else (True, soft_warn)
-
-# ─────────────────────────────────────────
-# CANDLE DATA
-# ─────────────────────────────────────────
-def get_candle_data(ticker, interval_str=""):
+def check_news(ticker):
+    if not NEWS_API_KEY:
+        return None, []
     try:
-        is_swing = any(x in str(interval_str).upper() for x in ["1D","1W","D","W","DAY","WEEK"])
-        df = yf.download(
-            ticker,
-            period="30d" if is_swing else "5d",
-            interval="1d" if is_swing else "15m",
-            progress=False
+        r = requests.get(
+            "https://newsapi.org/v2/everything",
+            params={"q": ticker, "sortBy": "publishedAt",
+                    "pageSize": 5, "apiKey": NEWS_API_KEY, "language": "en"},
+            timeout=5
         )
-        if df.empty:
-            return "No data"
-        lines = []
-        for ts, row in df.tail(10).iterrows():
-            lines.append(
-                f"{ts.strftime('%m/%d %H:%M')} | O:{float(row['Open']):.2f} "
-                f"H:{float(row['High']):.2f} L:{float(row['Low']):.2f} "
-                f"C:{float(row['Close']):.2f} V:{int(float(row['Volume']))}"
-            )
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Data error: {e}"
+        articles = r.json().get("articles", [])
+        if not articles:
+            return "neutral", []
+
+        neg_words = ["lawsuit","investigation","fraud","miss","loss","decline","crash",
+                     "ban","recall","downgrade","warning","bankruptcy","sec","fine","hack"]
+        pos_words = ["beat","upgrade","record","growth","profit","deal","partnership",
+                     "launch","breakthrough","strong","surge","buy"]
+
+        neg, pos, headlines = 0, 0, []
+        for a in articles[:3]:
+            title = a.get("title", "").lower()
+            headlines.append(a.get("title", ""))
+            neg += sum(1 for w in neg_words if w in title)
+            pos += sum(1 for w in pos_words if w in title)
+
+        sentiment = "negative" if neg > pos + 1 else "positive" if pos > neg else "neutral"
+        return sentiment, headlines
+    except:
+        return None, []
+
+def check_earnings(ticker):
+    try:
+        cal = yf.Ticker(ticker).calendar
+        if cal is None or (hasattr(cal, 'empty') and cal.empty):
+            return None
+        if hasattr(cal, 'columns') and 'Earnings Date' in cal.columns:
+            dates = cal['Earnings Date']
+            if len(dates) > 0:
+                ed = dates.iloc[0]
+                if hasattr(ed, 'date'):
+                    days = (ed.date() - datetime.now().date()).days
+                    return days if 0 <= days <= 14 else None
+        return None
+    except:
+        return None
+
+def check_earnings_week():
+    warnings = []
+    for ticker in WATCHLIST:
+        days = check_earnings(ticker)
+        if days is not None:
+            warnings.append(f"{ticker} earnings in {days} day{'s' if days != 1 else ''}")
+    return warnings
+
+def check_sector(ticker):
+    try:
+        etf = SECTOR_MAP.get(ticker, "SPY")
+        if etf == ticker:
+            return None
+        df = yf.download(etf, period="5d", interval="1d", progress=False)
+        if df.empty or len(df) < 2:
+            return None
+        chg = ((float(df["Close"].values[-1]) - float(df["Close"].values[-2]))
+               / float(df["Close"].values[-2]) * 100)
+        if chg < -1.5:
+            return f"⚠️ Sector ({etf}) down {chg:.1f}% today — weakens bullish signal"
+        elif chg > 1.5:
+            return f"✅ Sector ({etf}) up {chg:.1f}% today — strengthens bullish signal"
+        return f"↔️ Sector ({etf}) flat ({chg:+.1f}%)"
+    except:
+        return None
+
+def check_options(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        opts  = stock.options
+        if not opts:
+            return None
+        chain   = stock.option_chain(opts[0])
+        call_vol = chain.calls["volume"].sum()
+        put_vol  = chain.puts["volume"].sum()
+        if call_vol + put_vol == 0:
+            return None
+        pcr = put_vol / (call_vol + 1)
+        if pcr > 1.5:
+            return f"🐋 High PUT activity (P/C: {pcr:.1f}) — smart money hedging"
+        elif pcr < 0.5:
+            return f"🐋 High CALL activity (P/C: {pcr:.1f}) — bullish flow detected"
+        return None
+    except:
+        return None
+
+def check_mtf(ticker, interval_str):
+    try:
+        is_intraday = any(x in str(interval_str) for x in ["1","5","15","30","60"])
+        if not is_intraday:
+            return None
+        df = yf.download(ticker, period="30d", interval="1d", progress=False)
+        if df.empty or len(df) < 20:
+            return None
+        closes = df["Close"].values.flatten()
+        ema10  = sum(closes[-10:]) / 10
+        ema20  = sum(closes[-20:]) / 20
+        last   = float(closes[-1])
+        if last > ema10 > ema20:
+            return "✅ Daily uptrend confirmed — HIGH conviction"
+        elif last < ema10 < ema20:
+            return "⚠️ Daily downtrend — consider reducing size"
+        return "↔️ Daily mixed — MEDIUM conviction"
+    except:
+        return None
+
+def check_correlation(ticker):
+    warnings = []
+    for group in CORRELATED_GROUPS:
+        if ticker in group:
+            for ot in open_trades:
+                if ot in group and ot != ticker:
+                    warnings.append(f"⚠️ Open {ot} trade — {ticker} & {ot} highly correlated (double sector risk)")
+    return warnings
+
+def calculate_rr(entry, target1, stop):
+    try:
+        if not all([entry, target1, stop]):
+            return None
+        reward = abs(target1 - entry)
+        risk   = abs(entry - stop)
+        if risk == 0:
+            return None
+        rr    = reward / risk
+        emoji = "✅" if rr >= 2 else "⚠️" if rr >= 1.5 else "❌ Low"
+        return f"{emoji} R:R = {rr:.1f}:1 | Risk: ${risk:.2f} | Reward: ${reward:.2f}"
+    except:
+        return None
+
+# ─────────────────────────────────────────
+# WIN RATE
+# ─────────────────────────────────────────
+def get_win_rate():
+    resolved = [s for s in signal_log if s["result"] in ["win","loss"]]
+    last10   = resolved[-10:]
+    if len(last10) < 3:
+        return None
+    return (len([s for s in last10 if s["result"] == "win"]) / len(last10)) * 100
+
+# ─────────────────────────────────────────
+# ONLY 2 HARD BLOCKS
+# Everything else is info only
+# ─────────────────────────────────────────
+def hard_blocks_only(earnings_days):
+    blocks = []
+    if circuit_breaker["consecutive_losses"] >= 3:
+        blocks.append("⛔ Circuit breaker active — 3 consecutive losses. Reset with /reset")
+    if earnings_days is not None and earnings_days <= 2:
+        blocks.append(f"📅 Earnings in {earnings_days} days — too risky to trade")
+    return blocks
+
+# ─────────────────────────────────────────
+# WATCHLIST SCANNER
+# ─────────────────────────────────────────
+def scan_watchlist_setups():
+    setups = []
+    for ticker in WATCHLIST:
+        try:
+            df = yf.download(ticker, period="30d", interval="1d", progress=False)
+            if df.empty or len(df) < 20:
+                continue
+            closes = df["Close"].values.flatten()
+            highs  = df["High"].values.flatten()
+            lows   = df["Low"].values.flatten()
+            vols   = df["Volume"].values.flatten()
+            ema10  = sum(closes[-10:]) / 10
+            ema20  = sum(closes[-20:]) / 20
+            last   = float(closes[-1])
+            vol_avg = sum(vols[-20:]) / 20
+
+            gains, losses = [], []
+            for i in range(-14, 0):
+                diff = float(closes[i]) - float(closes[i-1])
+                if diff > 0: gains.append(diff); losses.append(0)
+                else: gains.append(0); losses.append(abs(diff))
+            avg_gain = sum(gains) / 14 if gains else 0.001
+            avg_loss = sum(losses) / 14 if losses else 0.001
+            rsi = 100 - (100 / (1 + avg_gain / avg_loss))
+
+            if rsi < 35 and last < ema20 and float(vols[-1]) > vol_avg:
+                setups.append(f"🎣 {ticker} — Oversold dip (RSI:{rsi:.0f}) + volume")
+            if last > float(highs[-2]) and float(vols[-1]) > vol_avg * 1.3:
+                setups.append(f"🚀 {ticker} — Breakout above recent high + volume")
+            if float(ema10) > float(ema20) and last < float(ema10) * 1.005 and rsi < 50:
+                setups.append(f"📈 {ticker} — Pullback to EMA10 in uptrend (RSI:{rsi:.0f})")
+        except:
+            pass
+    return setups[:5]
 
 # ─────────────────────────────────────────
 # CLAUDE ANALYSIS
 # ─────────────────────────────────────────
-def analyze_with_claude(alert_msg, candle_data, ticker, regime, rsi, win_rate, is_extended, context=""):
+def analyze_with_claude(alert_msg, candle_data, ticker, regime, rsi,
+                        win_rate, is_extended, enrichment_context):
     client       = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     win_rate_str = f"{win_rate:.0f}%" if win_rate else "Building..."
 
-    prompt = f"""You are an expert trading analyst. TradingView fired this confluence alert:
+    prompt = f"""You are an expert trading analyst. TradingView fired this 3-way confluence alert:
 "{alert_msg}"
 
-MARKET CONTEXT:
+MARKET CONTEXT (use this to inform your analysis):
 - Regime: {regime}
 - RSI(14): {rsi:.1f}
 - Win rate: {win_rate_str}
 - Extended hours: {is_extended}
-{context}
+{enrichment_context}
 
 Last 10 candles for {ticker}:
 {candle_data}
 
-Respond in this EXACT format:
+Respond in this EXACT format with specific prices:
 
-📊 *SIGNAL* — What triggered and why
-🌍 *REGIME* — How conditions affect this setup
+📊 *SIGNAL* — What triggered and confluence significance
+🌍 *REGIME* — How ALL context above affects this setup
 🎯 *BIAS* — Bullish/Bearish/Neutral | Conviction: Low/Medium/High
-💰 *ENTRY* — $XX.XX - $XX.XX
-🎯 *TARGET 1* — $XX.XX
-🎯 *TARGET 2* — $XX.XX
+💰 *ENTRY* — $XX.XX to $XX.XX
+🎯 *TARGET 1* — $XX.XX (conservative)
+🎯 *TARGET 2* — $XX.XX (extended)
 🛑 *STOP LOSS* — $XX.XX
 ⏱ *HOLD TIME* — X hours/days
-📐 *POSITION SIZE* — Risk X% of account
-⚠️ *RISK* — Key risks
+📐 *POSITION SIZE* — Risk X% of account (be conservative)
+⚠️ *RISK* — Top 2 risks specific to this setup
 
-Always give exact dollar amounts for entry, targets, stop."""
+Use ALL the context provided. Be specific with every price level."""
 
     msg = client.messages.create(
         model="claude-sonnet-4-20250514",
@@ -843,15 +737,11 @@ def log_signal(ticker, combo, price, levels=None):
     signal_log.append(entry)
     if len(signal_log) > 100:
         signal_log.pop(0)
-
-    # Log to Google Sheets
-    log_to_sheets({
-        "ticker": ticker, "combo": combo,
-        "price":  price,  "time":  entry["time"],
-        "target1": entry.get("target1", 0),
-        "target2": entry.get("target2", 0),
-        "stop":    entry.get("stop", 0)
-    })
+    if SHEETS_WEBHOOK:
+        try:
+            requests.post(SHEETS_WEBHOOK, json=entry, timeout=5)
+        except:
+            pass
     save_data()
 
 # ─────────────────────────────────────────
@@ -862,25 +752,24 @@ def handle_command(text, chat_id):
     cmd    = parts[0].lower()
     ticker = parts[1].upper() if len(parts) > 1 else None
 
-    if cmd in ["/win", "/loss", "/ignore"] and ticker:
-        mark_signal(ticker, cmd.replace("/",""), chat_id)
-    elif cmd == "/report":
-        send_report(chat_id)
-    elif cmd == "/status":
-        send_status(chat_id)
-    elif cmd in ["/info", "/start", "/help"]:
-        send_info(chat_id)
-    elif cmd == "/scan":
-        send_telegram("🔍 Scanning watchlist...", chat_id)
-        setups = scan_watchlist_setups()
-        if setups:
-            send_telegram("📊 *CURRENT SETUPS:*\n" + "\n".join(f"• {s}" for s in setups), chat_id)
-        else:
-            send_telegram("No high-conviction setups right now.", chat_id)
-    elif cmd == "/brief":
-        send_morning_brief()
-    elif cmd == "/weekly":
-        send_weekly_summary()
+    commands = {
+        "/win":     lambda: mark_signal(ticker, "win", chat_id) if ticker else send_telegram("Usage: /win TICKER", chat_id),
+        "/loss":    lambda: mark_signal(ticker, "loss", chat_id) if ticker else send_telegram("Usage: /loss TICKER", chat_id),
+        "/ignore":  lambda: mark_signal(ticker, "ignore", chat_id) if ticker else send_telegram("Usage: /ignore TICKER", chat_id),
+        "/report":  lambda: send_report(chat_id),
+        "/status":  lambda: send_status(chat_id),
+        "/scan":    lambda: send_scan(chat_id),
+        "/brief":   lambda: send_morning_brief(),
+        "/weekly":  lambda: send_weekly_summary(),
+        "/reset":   lambda: reset_circuit_breaker(chat_id),
+        "/info":    lambda: send_info(chat_id),
+        "/start":   lambda: send_info(chat_id),
+        "/help":    lambda: send_info(chat_id),
+    }
+
+    action = commands.get(cmd)
+    if action:
+        action()
     else:
         send_telegram("❓ Unknown command. Type /info for help.", chat_id)
 
@@ -898,18 +787,29 @@ def mark_signal(ticker, result, chat_id):
                 open_trades.pop(ticker, None)
             else:
                 emoji = "🚫"
-
             win_rate = get_win_rate()
             send_telegram(
                 f"{emoji} *{result.upper()}* — *{ticker}*\n"
-                f"Consecutive losses: {circuit_breaker['consecutive_losses']}\n"
+                f"Streak: {circuit_breaker['consecutive_losses']} losses\n"
                 f"Win rate: {f'{win_rate:.0f}%' if win_rate else 'Building...'}",
                 chat_id
             )
             save_data()
             return
-
     send_telegram(f"⚠️ No pending signal for *{ticker}*. Check /report.", chat_id)
+
+def reset_circuit_breaker(chat_id):
+    circuit_breaker["consecutive_losses"] = 0
+    save_data()
+    send_telegram("✅ Circuit breaker reset. Bot will fire alerts again.", chat_id)
+
+def send_scan(chat_id):
+    send_telegram("🔍 Scanning watchlist...", chat_id)
+    setups = scan_watchlist_setups()
+    if setups:
+        send_telegram("📊 *CURRENT SETUPS:*\n" + "\n".join(f"• {s}" for s in setups), chat_id)
+    else:
+        send_telegram("No high-conviction setups right now. Wait for better conditions.", chat_id)
 
 def send_report(chat_id):
     win_rate = get_win_rate()
@@ -929,18 +829,17 @@ def send_report(chat_id):
             combo_stats[c][s["result"]] += 1
 
     report  = f"📊 *PERFORMANCE REPORT*\n━━━━━━━━━━━━━━━━━━━━\n"
-    report += f"Total: {total} | ✅ {wins} | ❌ {losses} | 🚫 {ignored} | ⏳ {pending} | ⌛ {expired}\n"
+    report += f"Total: {total} | ✅{wins} | ❌{losses} | 🚫{ignored} | ⏳{pending} | ⌛{expired}\n"
     report += f"🎯 Win Rate: {f'{win_rate:.0f}%' if win_rate else 'Need 5+ trades'}\n\n"
-    report += f"🔧 *STATUS:* {'🔴 Circuit breaker ACTIVE' if circuit_breaker['consecutive_losses'] >= 3 else '🟢 Normal'}\n"
-    report += f"{'📉 Filters TIGHTENED' if win_rate and win_rate < 35 else '📈 Filters NORMAL'}\n\n"
-    report += f"*COMBO BREAKDOWN:*\n"
-
+    report += f"*STATUS:* {'🔴 Circuit breaker ACTIVE' if circuit_breaker['consecutive_losses'] >= 3 else '🟢 Normal'}\n"
+    report += f"Consecutive losses: {circuit_breaker['consecutive_losses']}\n\n"
+    report += "*COMBO BREAKDOWN:*\n"
     for combo, stats in combo_stats.items():
         total_c = stats["win"] + stats["loss"]
         wr = f"{(stats['win']/total_c*100):.0f}%" if total_c > 0 else "N/A"
         report += f"• {combo}: {stats['win']}W/{stats['loss']}L ({wr})\n"
 
-    report += f"\n*LAST 5:*\n"
+    report += "\n*LAST 5 SIGNALS:*\n"
     for s in signal_log[-5:]:
         e = "✅" if s["result"]=="win" else "❌" if s["result"]=="loss" else "🚫" if s["result"]=="ignore" else "⌛" if s["result"]=="expired" else "⏳"
         report += f"{e} {s['ticker']} | {s['combo']} | ${s['price']} | {str(s['time'])[11:16]}\n"
@@ -949,13 +848,15 @@ def send_report(chat_id):
 
 def send_status(chat_id):
     win_rate = get_win_rate()
+    pending  = len([s for s in signal_log if s["result"] == "pending"])
     send_telegram(
         f"🤖 *BOT STATUS*\n"
-        f"Signals: {len(signal_log)} | Pending: {len([s for s in signal_log if s['result']=='pending'])}\n"
+        f"Signals: {len(signal_log)} | Pending: {pending}\n"
         f"Win rate: {f'{win_rate:.0f}%' if win_rate else 'Building...'}\n"
         f"Consecutive losses: {circuit_breaker['consecutive_losses']}\n"
-        f"{'🔴 Circuit breaker ACTIVE' if circuit_breaker['consecutive_losses'] >= 3 else '🟢 Running normally'}\n"
-        f"Polling: 🟢 | Auto-check: 🟢 | Morning brief: 🟢",
+        f"{'🔴 Circuit breaker ACTIVE — type /reset to clear' if circuit_breaker['consecutive_losses'] >= 3 else '🟢 Running normally'}\n"
+        f"Open trades: {list(open_trades.keys()) or 'None'}\n"
+        f"Polling: 🟢 | Auto-check: 🟢 | Scheduler: 🟢",
         chat_id
     )
 
@@ -968,27 +869,30 @@ def send_info(chat_id):
         "`/loss NVDA` — mark most recent NVDA as loss\n"
         "`/ignore NVDA` — skip, don't count in stats\n\n"
         "📊 *PERFORMANCE:*\n"
-        "`/report` — full stats, combo breakdown, last 5\n"
+        "`/report` — full stats & combo breakdown\n"
         "`/status` — quick system health check\n\n"
         "🔍 *MARKET:*\n"
-        "`/scan` — scan watchlist for setups right now\n"
-        "`/brief` — get today's morning brief on demand\n"
-        "`/weekly` — get weekly performance summary\n\n"
-        "ℹ️ *HELP:*\n"
+        "`/scan` — scan watchlist for setups now\n"
+        "`/brief` — get morning brief on demand\n"
+        "`/weekly` — weekly performance summary\n\n"
+        "⚙️ *SYSTEM:*\n"
+        "`/reset` — reset circuit breaker\n"
         "`/info` — show this list\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "💡 *Auto features:*\n"
-        "• ✅❌ buttons on every alert — tap to log\n"
-        "• Auto price check at 4hr & 24hr\n"
-        "• Pending signals expire after 48hrs\n"
-        "• Morning brief at 9am ET weekdays\n"
-        "• Weekly summary every Sunday 8pm ET\n"
-        "• News, earnings, sector & options checked on every alert",
+        "💡 *How TradingView + Bot work together:*\n"
+        "• TradingView finds ALL signals (never blocked)\n"
+        "• Bot adds news, earnings, sector, options info\n"
+        "• Only 2 hard blocks: circuit breaker + earnings ≤2 days\n"
+        "• Everything else shown as info — YOU decide\n"
+        "• Tap ✅❌🚫 buttons on alerts to log instantly\n"
+        "• Auto price checks at 4hr & 24hr\n"
+        "• Morning brief 9am ET | Weekly recap Sundays",
         chat_id
     )
 
 # ─────────────────────────────────────────
 # MAIN WEBHOOK
+# TradingView signal → enrich → send
 # ─────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -1026,94 +930,100 @@ def webhook():
         except:
             price = 0.0
 
-        # All checks in parallel-ish
-        regime, rsi, is_extended     = detect_regime(ticker, interval_str)
-        win_rate                      = get_win_rate()
-        fire, warnings                = should_fire(ticker, combo, regime, rsi, is_extended)
-        news_sentiment, news_headlines = check_news_sentiment(ticker)
-        sector_note                   = check_sector_health(ticker)
-        options_note                  = check_options_flow(ticker)
-        earnings_days                 = check_earnings(ticker)
-        mtf_note                      = check_higher_timeframe(ticker, interval_str)
-        correlation_warns             = check_correlation_risk(ticker)
+        # ── ENRICHMENT (info only — never blocks) ──
+        regime, rsi, is_extended = get_regime_info(ticker, interval_str)
+        win_rate                  = get_win_rate()
+        news_sentiment, headlines = check_news(ticker)
+        sector_note               = check_sector(ticker)
+        options_note              = check_options(ticker)
+        earnings_days             = check_earnings(ticker)
+        mtf_note                  = check_mtf(ticker, interval_str)
+        corr_warns                = check_correlation(ticker)
+        rr_note                   = None  # filled after Claude analysis
 
-        # Hard block
-        if not fire:
-            hard = [w for w in warnings if not w.startswith("🌙")]
-            warn = f"⚠️ *SIGNAL FILTERED — {ticker}*\n"
-            warn += f"Combo: {combo} | Regime: {regime} | RSI: {rsi:.0f}\n\n"
-            warn += "🚫 *Reasons:*\n" + "\n".join(f"• {r}" for r in hard)
-            send_telegram(warn)
-            return jsonify({"status": "filtered"}), 200
+        # ── ONLY 2 HARD BLOCKS ──
+        blocks = hard_blocks_only(earnings_days)
+        if blocks:
+            msg = f"🚫 *SIGNAL BLOCKED — {ticker}*\n"
+            msg += f"TradingView fired: {combo}\n\n"
+            msg += "⛔ *Hard block reasons:*\n"
+            for b in blocks:
+                msg += f"• {b}\n"
+            msg += "\n_All other signals still fire normally_"
+            send_telegram(msg)
+            return jsonify({"status": "blocked"}), 200
 
-        # Build context for Claude
-        context_lines = []
-        if news_sentiment == "negative" and news_headlines:
-            context_lines.append(f"⚠️ NEGATIVE NEWS: {news_headlines[0][:80]}")
-        elif news_sentiment == "positive" and news_headlines:
-            context_lines.append(f"✅ POSITIVE NEWS: {news_headlines[0][:80]}")
-        if sector_note:
-            context_lines.append(sector_note)
-        if options_note:
-            context_lines.append(options_note)
-        if mtf_note:
-            context_lines.append(f"MTF: {mtf_note}")
-        if earnings_days is not None:
-            context_lines.append(f"⚠️ EARNINGS IN {earnings_days} DAYS")
-
-        context = "\n".join(context_lines)
-
-        # Get candles and analyze
+        # ── GET DATA ──
         candle_data = get_candle_data(ticker, interval_str)
-        analysis    = analyze_with_claude(
+
+        # ── BUILD ENRICHMENT CONTEXT FOR CLAUDE ──
+        ctx_lines = []
+        if news_sentiment == "negative" and headlines:
+            ctx_lines.append(f"⚠️ NEGATIVE NEWS: {headlines[0][:80]}")
+        elif news_sentiment == "positive" and headlines:
+            ctx_lines.append(f"✅ POSITIVE NEWS: {headlines[0][:80]}")
+        if sector_note:
+            ctx_lines.append(f"SECTOR: {sector_note}")
+        if options_note:
+            ctx_lines.append(f"OPTIONS: {options_note}")
+        if mtf_note:
+            ctx_lines.append(f"DAILY CHART: {mtf_note}")
+        if earnings_days is not None:
+            ctx_lines.append(f"⚠️ EARNINGS IN {earnings_days} DAYS — factor into hold time")
+        if is_extended:
+            ctx_lines.append("🌙 EXTENDED HOURS — lower liquidity")
+        enrichment_context = "\n".join(ctx_lines)
+
+        # ── CLAUDE ANALYSIS ──
+        analysis = analyze_with_claude(
             alert_text, candle_data, ticker,
-            regime, rsi, win_rate, is_extended, context
+            regime, rsi, win_rate,
+            is_extended, enrichment_context
         )
 
-        # Extract price levels
+        # ── EXTRACT PRICE LEVELS ──
         levels = extract_levels(analysis, price)
-
-        # Calculate R:R
         rr_note = calculate_rr(price, levels.get("target1", 0), levels.get("stop", 0))
 
-        # Build message
+        # ── BUILD TELEGRAM MESSAGE ──
         win_rate_str = f"{win_rate:.0f}%" if win_rate else "Building..."
         combo_emoji  = "🎣" if "Dip" in combo else "🚀" if "Momentum" in combo else "🚨"
 
-        message = f"{combo_emoji} *{combo.upper()} — {ticker}*\n"
+        message  = f"{combo_emoji} *{combo.upper()} — {ticker}*\n"
         message += f"🌍 Regime: {regime} | RSI: {rsi:.0f} | Win Rate: {win_rate_str}\n"
+        message += "━━━━━━━━━━━━━━━━━━━━\n"
 
-        # Add all context warnings
-        if warnings:
-            message += "\n".join(f"• {w}" for w in warnings) + "\n"
+        # Context info block
+        if is_extended:
+            message += "🌙 Extended hours — wider spreads\n"
         if earnings_days is not None:
-            message += f"📅 *EARNINGS IN {earnings_days} DAYS — elevated risk*\n"
+            message += f"📅 Earnings in {earnings_days} days — adjust hold time\n"
         if news_sentiment == "negative":
-            message += f"📰 *NEGATIVE NEWS DETECTED — trade carefully*\n"
+            message += f"📰 Negative news detected — trade carefully\n"
+        elif news_sentiment == "positive":
+            message += f"📰 Positive news — adds confidence\n"
         if sector_note:
             message += f"{sector_note}\n"
         if options_note:
             message += f"{options_note}\n"
         if mtf_note:
-            message += f"📊 MTF: {mtf_note}\n"
-        for cw in correlation_warns:
-            message += f"⚠️ {cw}\n"
+            message += f"📊 {mtf_note}\n"
+        for cw in corr_warns:
+            message += f"{cw}\n"
         if rr_note:
-            message += f"\n{rr_note}\n"
+            message += f"{rr_note}\n"
 
-        message += f"\n{analysis}\n\n"
+        message += "━━━━━━━━━━━━━━━━━━━━\n"
+        message += f"{analysis}\n\n"
         message += f"_Signal #{len(signal_log)+1} | {datetime.now().strftime('%H:%M')} ET_"
 
-        # Send with inline buttons
-        send_alert_with_buttons(message, ticker)
+        # ── SEND WITH BUTTONS ──
+        send_with_buttons(message, ticker)
 
-        # Track as open trade
-        open_trades[ticker] = {
-            "combo": combo, "price": price,
-            "time":  str(datetime.now())
-        }
-
+        # ── TRACK + LOG ──
+        open_trades[ticker] = {"combo": combo, "price": price, "time": str(datetime.now())}
         log_signal(ticker, combo, price, levels)
+
         return jsonify({"status": "ok"}), 200
 
     except Exception as e:
@@ -1128,11 +1038,13 @@ def webhook():
 def health():
     win_rate = get_win_rate()
     return (
-        f"🤖 Chart Bot Level 2 Full ✅\n"
+        f"🤖 Chart Bot — Final Version ✅\n"
+        f"Architecture: TradingView finds → Bot enriches\n"
+        f"Hard blocks: Circuit breaker + Earnings only\n"
+        f"Data: {'Alpha Vantage' if ALPHA_VANTAGE_KEY else 'yfinance 1min'}\n"
         f"Signals: {len(signal_log)}\n"
         f"Win rate: {f'{win_rate:.0f}%' if win_rate else 'Building...'}\n"
         f"Losses streak: {circuit_breaker['consecutive_losses']}\n"
-        f"Open trades: {list(open_trades.keys())}\n"
         f"All systems: 🟢"
     ), 200
 
